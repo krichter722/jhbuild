@@ -26,6 +26,7 @@ import pipes
 import imp
 import time
 from StringIO import StringIO
+import threading
 
 import cmds
 
@@ -392,6 +393,11 @@ class PacmanSystemInstall(SystemInstall):
 class AptSystemInstall(SystemInstall):
     def __init__(self):
         SystemInstall.__init__(self)
+        self.parallel = True
+        self.packages_lock = threading.Lock()
+            # Used for preventing multiple threads writing to the resulting
+            # native package list in `_try_append_native_package`. We only need
+            # a primitive lock.
 
     def _get_package_for(self, filename, exact_match):
         if exact_match:
@@ -422,7 +428,14 @@ class AptSystemInstall(SystemInstall):
     def _try_append_native_package(self, modname, filename, native_packages, exact_match):
         native_pkg = self._get_package_for(filename, exact_match)
         if native_pkg:
+            if self.parallel:
+                # it's cheaper to check a boolean than to acquire the lock even
+                # if parallel is False
+                self.packages_lock.acquire(True # blocking
+                        )
             native_packages.append(native_pkg)
+            if self.parallel:
+                self.packages_lock.release()
             return True
         return False
 
@@ -444,13 +457,41 @@ class AptSystemInstall(SystemInstall):
 
         pkgconfigs = [(modname, '/%s.pc' % pkg) for modname, pkg in
                       get_uninstalled_pkgconfigs(uninstalled)]
-        for modname, filename in pkgconfigs:
+        def __build_native_packages_pkgconfig__():
             self._append_native_package_or_warn(modname, filename, native_packages, False)
+        if not self.parallel:
+            for modname, filename in pkgconfigs:
+                __build_native_packages_pkgconfig__()
+        else:
+            packages_threads = []
+            for modname, filename in pkgconfigs:
+                packages_thread = threading.Thread(target=__build_native_packages_pkgconfig__)
+                packages_threads.append(packages_thread)
+                packages_thread.start()
+                logging.info(_("started native package search thread"))
+            while len(packages_threads) > 0:
+                logging.info(_("waiting for %d native package search threads to terminate" % (len(packages_threads),)))
+                packages_thread = packages_threads.pop()
+                packages_thread.join()
 
         binaries = [(modname, '/usr/bin/%s' % pkg) for modname, pkg in
                     get_uninstalled_binaries(uninstalled)]
-        for modname, filename in binaries:
-            self._append_native_package_or_warn(modname, filename, native_packages, True)
+        def __build_native_packages_binaries__():
+            self._append_native_package_or_warn(modname, filename, native_packages, True)        
+        if not self.parallel:
+            for modname, filename in binaries:
+                __build_native_packages_binaries__()
+        else:
+            packages_threads = []
+            for modname, filename in binaries:
+                packages_thread = threading.Thread(target=__build_native_packages_binaries__)
+                packages_threads.append(packages_thread)
+                packages_thread.start()
+                logging.info(_("started native package search thread"))
+            while len(packages_threads) > 0:
+                logging.info(_("waiting for %d native package search threads to terminate" % (len(packages_threads),)))
+                packages_thread = packages_threads.pop()
+                packages_thread.join()
 
         # Get multiarch include directory, e.g. /usr/include/x86_64-linux-gnu
         multiarch = None
@@ -462,12 +503,27 @@ class AptSystemInstall(SystemInstall):
             multiarch = subprocess.check_output(['gcc', '-print-multiarch']).strip()
 
         c_includes = get_uninstalled_c_includes(uninstalled)
-        for modname, filename in c_includes:
+        def __build_native_packages_c_includes__():
             # Try multiarch first, so we print the non-multiarch location on failure.
             if (multiarch == None or
                 not self._try_append_native_package(modname, '/usr/include/%s/%s' % (multiarch, filename), native_packages, True)):
                 self._append_native_package_or_warn(modname, '/usr/include/%s' % filename, native_packages, True)
-
+        logging.info(_("parallel: %s" % (str(self.parallel),)))
+        if not self.parallel:
+            for modname, filename in c_includes:
+                __build_native_packages_c_includes__()
+        else:
+            packages_threads = []
+            for modname, filename in c_includes:
+                packages_thread = threading.Thread(target=__build_native_packages_c_includes__)
+                packages_threads.append(packages_thread)
+                packages_thread.start()
+                logging.info(_("started native package search thread"))
+            while len(packages_threads) > 0:
+                logging.info(_("waiting for %d native package search threads to terminate" % (len(packages_threads),)))
+                packages_thread = packages_threads.pop()
+                packages_thread.join()
+            
         if native_packages:
             self._install_packages(native_packages)
         else:
